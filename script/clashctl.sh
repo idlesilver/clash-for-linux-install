@@ -38,11 +38,17 @@ _unset_system_proxy() {
 
 function clashon() {
     _get_proxy_port
-    systemctl is-active "$BIN_KERNEL_NAME" >&/dev/null || {
-        sudo systemctl start "$BIN_KERNEL_NAME" >/dev/null || {
+    _service_is_active "$BIN_KERNEL_NAME" || {
+        if [ "$INIT_SYSTEM" = "systemd" ]; then
+            sudo systemctl start "$BIN_KERNEL_NAME" >/dev/null
+        else
+            sudo service "$BIN_KERNEL_NAME" start >/dev/null || sudo "/etc/init.d/$BIN_KERNEL_NAME" start >/dev/null
+        fi
+        
+        if [ $? -ne 0 ]; then
             _failcat '启动失败: 执行 clashstatus 查看日志'
             return 1
-        }
+        fi
     }
     _set_system_proxy
     _okcat '已开启代理环境'
@@ -57,8 +63,18 @@ watch_proxy() {
 }
 
 function clashoff() {
-    sudo systemctl stop "$BIN_KERNEL_NAME" && _okcat '已关闭代理环境' ||
-        _failcat '关闭失败: 执行 "clashstatus" 查看日志' || return 1
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        sudo systemctl stop "$BIN_KERNEL_NAME"
+    else
+        sudo service "$BIN_KERNEL_NAME" stop || sudo "/etc/init.d/$BIN_KERNEL_NAME" stop
+    fi
+    
+    if [ $? -eq 0 ]; then
+        _okcat '已关闭代理环境'
+    else
+        _failcat '关闭失败: 执行 "clashstatus" 查看日志'
+        return 1
+    fi
     _unset_system_proxy
 }
 
@@ -69,7 +85,7 @@ clashrestart() {
 function clashproxy() {
     case "$1" in
     on)
-        systemctl is-active "$BIN_KERNEL_NAME" >&/dev/null || {
+        _service_is_active "$BIN_KERNEL_NAME" || {
             _failcat '代理程序未运行，请执行 clashon 开启代理环境'
             return 1
         }
@@ -102,7 +118,11 @@ EOF
 }
 
 function clashstatus() {
-    sudo systemctl status "$BIN_KERNEL_NAME" "$@"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        sudo systemctl status "$BIN_KERNEL_NAME" "$@"
+    else
+        sudo service "$BIN_KERNEL_NAME" status "$@" || sudo "/etc/init.d/$BIN_KERNEL_NAME" status "$@"
+    fi
 }
 
 function clashui() {
@@ -178,10 +198,21 @@ _tunon() {
     sudo "$BIN_YQ" -i '.tun.enable = true' "$CLASH_CONFIG_MIXIN"
     _merge_config_restart
     sleep 0.5s
-    sudo journalctl -u "$BIN_KERNEL_NAME" --since "1 min ago" | grep -E -m1 'unsupported kernel version|Start TUN listening error' && {
-        _tunoff >&/dev/null
-        _error_quit '不支持的内核版本'
-    }
+    
+    # 检查日志，优先使用journalctl，如果不存在则检查进程状态
+    if command -v journalctl >&/dev/null && [ "$INIT_SYSTEM" = "systemd" ]; then
+        sudo journalctl -u "$BIN_KERNEL_NAME" --since "1 min ago" | grep -E -m1 'unsupported kernel version|Start TUN listening error' && {
+            _tunoff >&/dev/null
+            _error_quit '不支持的内核版本'
+        }
+    else
+        # 对于SysV系统，检查服务状态和可能的错误日志
+        if ! _service_is_active "$BIN_KERNEL_NAME"; then
+            _tunoff >&/dev/null
+            _error_quit '启动失败，可能是不支持的内核版本'
+        fi
+    fi
+    
     _okcat "Tun 模式已开启"
 }
 

@@ -225,7 +225,14 @@ function _is_root() {
 function _valid_env() {
     _is_root || _error_quit "需要 root 或 sudo 权限执行"
     [ -n "$ZSH_VERSION" ] && [ -n "$BASH_VERSION" ] && _error_quit "仅支持：bash、zsh"
-    [ "$(ps -p 1 -o comm=)" != "systemd" ] && _error_quit "系统不具备 systemd"
+    # 检查是否有systemd或SysV init
+    if [ "$(ps -p 1 -o comm=)" = "systemd" ]; then
+        INIT_SYSTEM="systemd"
+    elif [ -d "/etc/init.d" ]; then
+        INIT_SYSTEM="sysv"
+    else
+        _error_quit "系统不具备 systemd 或 SysV init"
+    fi
 }
 
 function _valid_config() {
@@ -357,4 +364,253 @@ _start_convert() {
 }
 _stop_convert() {
     pkill -9 -f "$BIN_SUBCONVERTER" >&/dev/null
+}
+
+# 生成SysV init脚本的函数
+_generate_sysv_script() {
+    local service_name="$1"
+    local exec_path="$2"
+    local config_path="$3"
+    local base_dir="$4"
+    
+    cat <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: $service_name
+# Required-Start: \$syslog \$local_fs \$network 
+# Required-Stop: \$syslog \$local_fs \$network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: $service_name Daemon, A[nother] Clash Kernel.
+### END INIT INFO
+
+. /lib/lsb/init-functions
+prog=$service_name
+PIDFILE=/var/run/\$prog.pid
+DESC="$service_name Daemon, A[nother] Clash Kernel."
+
+start() {
+	log_daemon_msg "Starting \$DESC" "\$prog"
+	
+	# 检查是否已经在运行
+	if [ -f \$PIDFILE ]; then
+		PID=\$(cat \$PIDFILE)
+		if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
+			log_end_msg 0
+			echo "\$prog is already running with PID \$PID"
+			return 0
+		fi
+	fi
+	
+	# 启动服务并记录PID
+	start-stop-daemon --start --quiet --pidfile \$PIDFILE --exec $exec_path --background --make-pidfile -- -d $base_dir -f $config_path
+	
+	if [ \$? -ne 0 ]; then
+		log_end_msg 1
+		exit 1
+	fi
+	
+	# 等待一下确保服务启动
+	sleep 1
+	if [ -f \$PIDFILE ]; then
+		PID=\$(cat \$PIDFILE)
+		if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
+			log_end_msg 0
+		else
+			log_end_msg 1
+			exit 1
+		fi
+	else
+		log_end_msg 1
+		exit 1
+	fi
+	exit 0
+}
+
+stop() {
+	log_daemon_msg "Stopping \$DESC" "\$prog"
+	
+	if [ -f \$PIDFILE ]; then
+		PID=\$(cat \$PIDFILE)
+		if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
+			kill "\$PID"
+			
+			# 等待进程结束
+			for i in \$(seq 1 10); do
+				if ! kill -0 "\$PID" 2>/dev/null; then
+					break
+				fi
+				sleep 1
+			done
+			
+			# 如果还没结束，强制杀死
+			if kill -0 "\$PID" 2>/dev/null; then
+				kill -9 "\$PID"
+			fi
+			
+			rm -f \$PIDFILE
+		fi
+	fi
+	
+	# 确保所有相关进程都被杀死
+	pkill -f "$exec_path" 2>/dev/null || true
+	
+	log_end_msg 0
+}
+
+status() {
+	if [ -f \$PIDFILE ]; then
+		PID=\$(cat \$PIDFILE)
+		if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
+			echo "\$prog is running with PID \$PID"
+			return 0
+		else
+			echo "\$prog is not running (stale PID file)"
+			rm -f \$PIDFILE
+			return 1
+		fi
+	else
+		echo "\$prog is not running"
+		return 1
+	fi
+}
+
+reload() {
+	log_daemon_msg "Reloading \$DESC" "\$prog"
+	if [ -f \$PIDFILE ]; then
+		PID=\$(cat \$PIDFILE)
+		if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
+			kill -HUP "\$PID"
+			log_end_msg 0
+		else
+			log_end_msg 1
+			exit 1
+		fi
+	else
+		log_end_msg 1
+		exit 1
+	fi
+	exit 0
+}
+
+force_reload() {
+	stop
+	start
+}
+
+case "\$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	status)
+		status
+		;;
+	force-reload)
+		force_reload
+		;;
+	restart)
+		stop
+		start
+		;;
+	reload)
+		reload
+		;;
+	*)
+		echo "Usage: \$prog {start|stop|status|reload|force-reload|restart}"
+		exit 2
+esac
+EOF
+}
+
+# 服务管理统一函数
+_service_start() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl start "$service_name"
+    else
+        service "$service_name" start || {
+            # 如果service命令不可用，直接调用init脚本
+            [ -x "/etc/init.d/$service_name" ] && "/etc/init.d/$service_name" start
+        }
+    fi
+}
+
+_service_stop() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop "$service_name"
+    else
+        service "$service_name" stop || {
+            # 如果service命令不可用，直接调用init脚本
+            [ -x "/etc/init.d/$service_name" ] && "/etc/init.d/$service_name" stop
+        }
+    fi
+}
+
+_service_restart() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl restart "$service_name"
+    else
+        service "$service_name" restart || {
+            # 如果service命令不可用，直接调用init脚本
+            [ -x "/etc/init.d/$service_name" ] && "/etc/init.d/$service_name" restart
+        }
+    fi
+}
+
+_service_status() {
+    local service_name="$1"
+    shift
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl status "$service_name" "$@"
+    else
+        service "$service_name" status "$@" || {
+            # 如果service命令不可用，直接调用init脚本
+            [ -x "/etc/init.d/$service_name" ] && "/etc/init.d/$service_name" status "$@"
+        }
+    fi
+}
+
+_service_is_active() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl is-active "$service_name" >&/dev/null
+    else
+        service "$service_name" status >&/dev/null || {
+            # 如果service命令不可用，直接调用init脚本
+            [ -x "/etc/init.d/$service_name" ] && "/etc/init.d/$service_name" status >&/dev/null
+        }
+    fi
+}
+
+_service_enable() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl enable "$service_name"
+    else
+        if command -v update-rc.d >&/dev/null; then
+            update-rc.d "$service_name" defaults
+        elif command -v chkconfig >&/dev/null; then
+            chkconfig --add "$service_name"
+            chkconfig "$service_name" on
+        fi
+    fi
+}
+
+_service_disable() {
+    local service_name="$1"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl disable "$service_name"
+    else
+        if command -v update-rc.d >&/dev/null; then
+            update-rc.d -f "$service_name" remove
+        elif command -v chkconfig >&/dev/null; then
+            chkconfig "$service_name" off
+            chkconfig --del "$service_name"
+        fi
+    fi
 }
